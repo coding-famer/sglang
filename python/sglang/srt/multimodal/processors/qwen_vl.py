@@ -314,6 +314,18 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        # Token-in-token-out: when input is List[int], replace with dummy text
+        # so that load_mm_data/HF Processor gets standard single-pad form.
+        original_input_ids = None
+        if isinstance(input_text, list):
+            original_input_ids = input_text
+            n_images = len(image_data) if image_data else 0
+            n_videos = len(request_obj.video_data) if request_obj.video_data else 0
+            parts = []
+            parts.extend([self.mm_tokens.image_token] * n_images)
+            parts.extend(["<|vision_start|><|video_pad|><|vision_end|>"] * n_videos)
+            input_text = "".join(parts)
+
         entry_time = time.perf_counter()
         base_output = self.legacy_load_mm_data(
             prompt=input_text,
@@ -386,6 +398,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             if isinstance(first_video, dict):
                 video_grid_thw = first_video.get("video_grid_thw")
 
+        # For token-in-token-out, use original input_ids for mrope computation
+        # (the HF Processor input_ids are from dummy text, not the real prompt)
+        if original_input_ids is not None:
+            mrope_input_ids = torch.tensor(original_input_ids, dtype=torch.long)
+        else:
+            mrope_input_ids = input_ids
+
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
@@ -395,8 +414,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
-            # use the expanded token ids
-            input_ids=input_ids.unsqueeze(0),
+            input_ids=mrope_input_ids.unsqueeze(0),
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
             second_per_grid_ts=second_per_grid_ts,
@@ -419,8 +437,19 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             f"total_time: {(get_rope_index_time - entry_time) * 1000:.2f} ms"
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
+        # For token-in-token-out, recompute mm_item offsets based on the
+        # original input_ids (not the dummy text input_ids).
+        if original_input_ids is not None:
+            orig_ids_tensor = torch.tensor(original_input_ids, dtype=torch.long)
+            for mm_item in mm_items:
+                mm_token_id = self.mm_tokens.get_token_id_by_modality(mm_item.modality)
+                if mm_token_id is not None:
+                    mm_item.offsets = self.get_mm_items_offset(
+                        input_ids=orig_ids_tensor,
+                        mm_token_id=mm_token_id,
+                    )
+
+        result = {
             "mm_items": mm_items,
             "im_start_id": self.vision_start_token_id,
             "im_end_id": self.vision_end_token_id,
@@ -430,3 +459,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
         }
+        # For token-in-token-out, don't return input_ids so that
+        # tokenizer_manager preserves the caller's original input_ids.
+        if original_input_ids is None:
+            result["input_ids"] = input_ids.tolist()
+        return result
