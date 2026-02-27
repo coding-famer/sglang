@@ -20,6 +20,7 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import deque
 from http import HTTPStatus
@@ -276,6 +277,12 @@ class PrefillBootstrapQueue:
             [req.disagg_kv_sender for req in self.queue], self.gloo_group
         )
 
+        # Bootstrap timeout: if a request has been stuck in Bootstrapping for too long, treat it as failed.
+        bootstrap_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
+        )
+        now = time.perf_counter()
+
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None:
                 # if req not in reqs_info_to_check, skip
@@ -283,6 +290,27 @@ class PrefillBootstrapQueue:
                     continue
 
             if poll == KVPoll.Bootstrapping:
+                # Check for bootstrap timeout
+                entry_time = getattr(
+                    req.time_stats,
+                    "prefill_bootstrap_queue_entry_time",
+                    None,
+                )
+                if entry_time is not None and (now - entry_time) > bootstrap_timeout:
+                    error_message = (
+                        f"Prefill bootstrap timed out after {now - entry_time:.1f}s "
+                        f"for request rank={self.tp_rank} "
+                        f"{req.rid=} {req.bootstrap_room=}"
+                    )
+                    logger.error(error_message)
+                    prepare_abort(
+                        req, error_message, status_code=HTTPStatus.GATEWAY_TIMEOUT
+                    )
+                    self.scheduler.stream_output([req], req.return_logprob)
+                    indices_to_remove.add(i)
+                    failed_reqs.append(req)
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                 continue
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
@@ -316,6 +344,14 @@ class PrefillBootstrapQueue:
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+            logger.info(
+                "PD prefill bootstrapped rid=%s room=%s pp_rank=%s tp_rank=%s num_pages=%s",
+                req.rid,
+                req.bootstrap_room,
+                self.pp_rank,
+                self.tp_rank,
+                num_pages,
+            )
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
@@ -334,6 +370,15 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs
         else:
             return bootstrapped_reqs, failed_reqs
+
+    def release_memory_occupation(self):
+        self.queue.clear()
+        if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
+            self.kv_manager.deregister_buffer_to_engine()
+
+    def resume_memory_occupation(self):
+        if hasattr(self.kv_manager, "register_buffer_to_engine"):
+            self.kv_manager.register_buffer_to_engine()
 
 
 class SchedulerDisaggregationPrefillMixin:
@@ -564,6 +609,13 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
+        # Transfer timeout: if a request has been in the inflight queue for too long
+        # (e.g., stuck in WaitingForInput/Transferring), treat it as failed.
+        transfer_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
+        )
+        now = time.perf_counter()
+
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
@@ -573,10 +625,35 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
-                assert poll == KVPoll.Success or poll == KVPoll.Failed
+                if poll not in (KVPoll.Success, KVPoll.Failed):
+                    undone_reqs.append(req)
+                    continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
-                undone_reqs.append(req)
+                # Check for transfer timeout
+                entry_time = getattr(
+                    req.time_stats,
+                    "prefill_transfer_queue_entry_time",
+                    None,
+                )
+                if entry_time is not None and (now - entry_time) > transfer_timeout:
+                    error_message = (
+                        f"Prefill transfer timed out after {now - entry_time:.1f}s "
+                        f"(state={poll}) for request rank={self.tp_rank} "
+                        f"{req.rid=} {req.bootstrap_room=}"
+                    )
+                    logger.error(error_message)
+                    release_kv_cache(req, self.tree_cache)  # unlock the tree
+                    prepare_abort(
+                        req, error_message, status_code=HTTPStatus.GATEWAY_TIMEOUT
+                    )
+                    if hasattr(req.disagg_kv_sender, "clear"):
+                        req.disagg_kv_sender.clear()
+                    done_reqs.append(req)
+                    if self.enable_metrics:
+                        self.metrics_collector.increment_transfer_failed_reqs()
+                else:
+                    undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
@@ -747,4 +824,13 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
+        logger.info(
+            "PD prefill send chunk rid=%s room=%s pp_rank=%s tp_rank=%s pages=%s last_chunk=%s",
+            req.rid,
+            req.bootstrap_room,
+            self.pp_rank,
+            self.tp_rank,
+            len(page_indices),
+            last_chunk,
+        )
         req.disagg_kv_sender.send(page_indices, state_indices)

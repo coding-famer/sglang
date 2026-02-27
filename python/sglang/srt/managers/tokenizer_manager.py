@@ -324,8 +324,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         if self.server_args.tokenizer_worker_num == 1:
+            self.send_to_scheduler_context = zmq.Context(1)
             self.send_to_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+                self.send_to_scheduler_context,
+                zmq.PUSH,
+                port_args.scheduler_input_ipc_name,
+                True,
             )
         else:
             from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
@@ -337,6 +341,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+        if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:
+            logger.info(
+                "PD prefill tokenizer ipc send_to_scheduler=%s recv_from_detokenizer=%s",
+                port_args.scheduler_input_ipc_name,
+                port_args.tokenizer_ipc_name,
+            )
 
     def init_running_status(self):
         # Request states
@@ -1060,6 +1070,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and isinstance(tokenized_obj, TokenizedGenerateReqInput)
+        ):
+            logger.info(
+                "PD prefill tokenizer send rid=%s room=%s bootstrap=%s:%s",
+                tokenized_obj.rid,
+                tokenized_obj.bootstrap_room,
+                tokenized_obj.bootstrap_host,
+                tokenized_obj.bootstrap_port,
+            )
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         tokenized_obj = wrap_shm_features(tokenized_obj)
@@ -1327,7 +1348,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
-                await self.send_to_scheduler.send_pyobj(obj)
+                self.send_to_scheduler.send_pyobj(obj)
             else:
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
@@ -1341,7 +1362,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
-            await self.send_to_scheduler.send_pyobj(obj)
+            self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(

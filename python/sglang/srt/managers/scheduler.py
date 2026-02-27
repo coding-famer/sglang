@@ -114,6 +114,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    PostProcessWeightsReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -452,6 +453,12 @@ class Scheduler(
                         self.recv_from_tokenizer,
                         self.recv_from_rpc,
                     ]
+                )
+            if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:
+                logger.info(
+                    "PD prefill scheduler ipc recv_from_tokenizer=%s recv_from_rpc=%s",
+                    port_args.scheduler_input_ipc_name,
+                    port_args.rpc_ipc_name,
                 )
         else:
             self.recv_from_tokenizer = None
@@ -1063,6 +1070,7 @@ class Scheduler(
                 ),
                 (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
+                (PostProcessWeightsReqInput, self.post_process_weights),
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
@@ -1248,6 +1256,17 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+                if (
+                    self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and len(recv_reqs) > 0
+                ):
+                    logger.info(
+                        "PD prefill recv_requests raw_count=%s pp_rank=%s tp_rank=%s attn_cp_rank=%s",
+                        len(recv_reqs),
+                        self.pp_rank,
+                        self.tp_rank,
+                        self.attn_cp_rank,
+                    )
             else:
                 recv_reqs = None
         else:
@@ -1303,6 +1322,14 @@ class Scheduler(
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
+            )
+        if self.disaggregation_mode == DisaggregationMode.PREFILL and len(recv_reqs) > 0:
+            logger.info(
+                "PD prefill recv_requests post_bcast_count=%s pp_rank=%s tp_rank=%s attn_cp_rank=%s",
+                len(recv_reqs),
+                self.pp_rank,
+                self.tp_rank,
+                self.attn_cp_rank,
             )
 
         # Process MM requests under EPD-disaggregation mode
@@ -1364,6 +1391,18 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
 
         for recv_req in recv_reqs:
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and isinstance(recv_req, TokenizedGenerateReqInput)
+            ):
+                logger.info(
+                    "PD prefill scheduler recv rid=%s room=%s pp_rank=%s tp_rank=%s attn_cp_rank=%s",
+                    recv_req.rid,
+                    recv_req.bootstrap_room,
+                    self.pp_rank,
+                    self.tp_rank,
+                    self.attn_cp_rank,
+                )
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
                 self.chunked_req is not None
@@ -1687,6 +1726,13 @@ class Scheduler(
             req.time_stats.wait_queue_entry_time = time.perf_counter()
             trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            logger.info(
+                "PD prefill enqueue rid=%s room=%s pp_rank=%s tp_rank=%s",
+                req.rid,
+                req.bootstrap_room,
+                self.pp_rank,
+                self.tp_rank,
+            )
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -3160,6 +3206,12 @@ def run_scheduler_process(
 
         # Dispatch to the appropriate event loop based on the disaggregation mode
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+        logger.info(
+            "PD scheduler loop dispatch mode=%s pp_size=%s enable_overlap=%s",
+            disaggregation_mode,
+            server_args.pp_size,
+            scheduler.enable_overlap,
+        )
         if disaggregation_mode == DisaggregationMode.NULL:
             if scheduler.enable_pdmux:
                 scheduler.event_loop_pdmux()

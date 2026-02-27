@@ -20,6 +20,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     is_dp_attention_enabled,
+    set_is_extend_in_batch,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -197,6 +198,22 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if (
+                    self.pp_rank == 0
+                    and self.tp_rank == 0
+                    and self.attn_cp_rank == 0
+                    and mb_id == 0
+                ):
+                    if not hasattr(self, "_pd_prefill_loop_heartbeat"):
+                        self._pd_prefill_loop_heartbeat = 0
+                    self._pd_prefill_loop_heartbeat += 1
+                    if self._pd_prefill_loop_heartbeat == 1:
+                        logger.info("PD prefill loop heartbeat iter=1")
+                    elif self._pd_prefill_loop_heartbeat % 2000 == 0:
+                        logger.info(
+                            "PD prefill loop heartbeat iter=%s",
+                            self._pd_prefill_loop_heartbeat,
+                        )
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
@@ -224,7 +241,24 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
-                batch = self.maybe_prepare_mlp_sync_batch(batch)
+                need_mlp_sync = self.require_mlp_sync
+                skipped_mlp_sync = False
+                if (
+                    need_mlp_sync
+                    and self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and self.server_args.enable_nsa_prefill_context_parallel
+                    and self.pp_size > 1
+                ):
+                    # In PD prefill CP+PP, MLP sync all_gather can deadlock on idle micro-batches.
+                    # Skip MLP sync here because decode-side MLP gather is not involved in this path.
+                    need_mlp_sync = False
+                    skipped_mlp_sync = True
+                batch = self.maybe_prepare_mlp_sync_batch(batch, need_sync=need_mlp_sync)
+                if skipped_mlp_sync:
+                    # MLP sync was skipped but set_is_extend_in_batch is still needed
+                    # by the deepep dispatcher (called in model forward).
+                    is_extend = batch.forward_mode.is_extend() if batch is not None else False
+                    set_is_extend_in_batch(is_extend)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -859,7 +893,7 @@ class SchedulerPPMixin:
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
-        if self.attn_tp_rank == 0:
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             dp_offset = self.attn_dp_rank * self.attn_tp_size
             p2p_work = point_to_point_pyobj(
                 data,
@@ -872,7 +906,7 @@ class SchedulerPPMixin:
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
-        if self.attn_tp_rank == 0:
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             dp_offset = self.attn_dp_rank * self.attn_tp_size
             data = point_to_point_pyobj(
                 [],
@@ -883,6 +917,14 @@ class SchedulerPPMixin:
             )
         else:
             data = None
+
+        if self.attn_cp_size > 1:
+            data = broadcast_pyobj(
+                data,
+                self.attn_cp_group.rank,
+                self.attn_cp_cpu_group,
+                src=self.attn_cp_group.ranks[0],
+            )
 
         if self.attn_tp_size > 1:
             data = broadcast_pyobj(

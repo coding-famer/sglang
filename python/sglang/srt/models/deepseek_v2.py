@@ -157,6 +157,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 
 if _use_aiter_gfx95:
 

@@ -260,6 +260,19 @@ class MooncakeKVManager(CommonKVManager):
                 self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
             )
 
+    def deregister_buffer_to_engine(self):
+        # Batch deregister KV data buffers
+        if self.kv_args.kv_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+
+        # Batch deregister auxiliary data buffers
+        if self.kv_args.aux_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+
+        # Batch deregister state/extra pool data buffers
+        if self.kv_args.state_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.state_data_ptrs)
+
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:
             return 0
@@ -895,6 +908,25 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
                             polls.append(True if ret == 0 else False)
+                            if ret != 0:
+                                # Mark session as failed to avoid hanging
+                                # on subsequent batch_transfer_sync calls
+                                with self.session_lock:
+                                    self.session_failures[
+                                        req.mooncake_session_id
+                                    ] += 1
+                                    if (
+                                        self.session_failures[
+                                            req.mooncake_session_id
+                                        ]
+                                        >= 1
+                                    ):
+                                        self.failed_sessions.add(
+                                            req.mooncake_session_id
+                                        )
+                                        logger.error(
+                                            f"Session {req.mooncake_session_id} failed (send_aux)."
+                                        )
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
                             )
@@ -902,6 +934,16 @@ class MooncakeKVManager(CommonKVManager):
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                logger.info(
+                                    "PD prefill transfer conclude room=%s status=%s pp_rank=%s attn_tp_rank=%s local_rank=%s polls=%s required_dst_info_num=%s",
+                                    req.room,
+                                    status,
+                                    self.pp_rank,
+                                    self.attn_tp_rank,
+                                    local_rank,
+                                    len(polls),
+                                    req.required_dst_info_num,
+                                )
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
@@ -950,6 +992,13 @@ class MooncakeKVManager(CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
+                    logger.info(
+                        "PD prefill bootstrap recv room=%s required_dst_info_num=%s pp_rank=%s attn_tp_rank=%s",
+                        room,
+                        required_dst_info_num,
+                        self.pp_rank,
+                        self.attn_tp_rank,
+                    )
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
@@ -1333,6 +1382,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
+            logger.info(
+                "PD decode init room=%s required_dst_info_num=%s target_bootstrap=%s:%s is_dummy=%s",
+                self.bootstrap_room,
+                self.required_dst_info_num,
+                bootstrap_info["rank_ip"],
+                bootstrap_info["rank_port"],
+                is_dummy,
+            )
 
             with lock:
                 sock.send_multipart(

@@ -6,6 +6,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
 from sglang.srt.models.deepseek_common.utils import _is_hip
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import use_intel_amx_backend
+from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
 
@@ -150,6 +151,8 @@ def handle_attention_nsa(attn, forward_batch):
     backend = forward_batch.attn_backend
     if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
         backend = backend.primary
+    if isinstance(backend, HybridAttnBackend):
+        backend = backend._select_backend(forward_batch.forward_mode)
     if hasattr(backend, "use_mha") and backend.use_mha:
         return AttnForwardMethod.MHA_ONE_SHOT
     return AttnForwardMethod.MLA
