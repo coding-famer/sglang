@@ -270,6 +270,20 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             audio_token_id=self.audio_token_id,
         ).build(_processor)
 
+    def build_dummy_text(self, mm_tokens, n_images=0, n_videos=0, n_audios=0):
+        # Qwen video token needs vision_start/end wrapping, unlike the default
+        # mm_tokens.video_token which is just "<|video_pad|>".
+        parts = []
+        if mm_tokens.image_token and n_images:
+            parts.extend([mm_tokens.image_token] * n_images)
+        if n_videos:
+            parts.extend(
+                ["<|vision_start|><|video_pad|><|vision_end|>"] * n_videos
+            )
+        if mm_tokens.audio_token and n_audios:
+            parts.extend([mm_tokens.audio_token] * n_audios)
+        return "".join(parts)
+
     def get_mm_data(self, prompt, embeddings, img_grid_thw):
         input_ids, offsets = self.build_input_ids(prompt, img_grid_thw)
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
@@ -314,6 +328,18 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        # Token-in-token-out: when input is List[int], replace with dummy text
+        # so that load_mm_data/HF Processor gets standard single-pad form.
+        original_input_ids = None
+        if isinstance(input_text, list):
+            original_input_ids = input_text
+            input_text = self.build_dummy_text(
+                mm_tokens=self.mm_tokens,
+                n_images=len(image_data) if image_data else 0,
+                n_videos=len(request_obj.video_data) if request_obj.video_data else 0,
+                n_audios=len(request_obj.audio_data) if request_obj.audio_data else 0,
+            )
+
         entry_time = time.perf_counter()
         base_output = self.legacy_load_mm_data(
             prompt=input_text,
@@ -386,6 +412,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             if isinstance(first_video, dict):
                 video_grid_thw = first_video.get("video_grid_thw")
 
+        # For token-in-token-out, use original input_ids for mrope computation
+        # (the HF Processor input_ids are from dummy text, not the real prompt)
+        if original_input_ids is not None:
+            mrope_input_ids = torch.tensor(original_input_ids, dtype=torch.long)
+        else:
+            mrope_input_ids = input_ids
+
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
@@ -395,8 +428,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
-            # use the expanded token ids
-            input_ids=input_ids.unsqueeze(0),
+            input_ids=mrope_input_ids.unsqueeze(0),
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
             second_per_grid_ts=second_per_grid_ts,
@@ -419,8 +451,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             f"total_time: {(get_rope_index_time - entry_time) * 1000:.2f} ms"
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
+        # For token-in-token-out, recompute mm_item offsets based on the
+        # original input_ids (not the dummy text input_ids).
+        if original_input_ids is not None:
+            self.finalize_token_in_token_out(
+                mm_items, self.mm_tokens, original_input_ids
+            )
+
+        result = {
             "mm_items": mm_items,
             "im_start_id": self.vision_start_token_id,
             "im_end_id": self.vision_end_token_id,
@@ -430,3 +468,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
         }
+        # For token-in-token-out, don't return input_ids so that
+        # tokenizer_manager preserves the caller's original input_ids.
+        if original_input_ids is None:
+            result["input_ids"] = input_ids.tolist()
+        return result
