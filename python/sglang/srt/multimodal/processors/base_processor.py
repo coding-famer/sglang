@@ -621,7 +621,7 @@ class BaseMultimodalProcessor(ABC):
 
     def load_mm_data(
         self,
-        prompt: str,
+        prompt: Union[str, List[int]],
         multimodal_tokens: MultimodalSpecialTokens,
         image_data: Optional[list] = None,
         video_data: Optional[list] = None,
@@ -634,11 +634,20 @@ class BaseMultimodalProcessor(ABC):
         BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
 
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
-        if isinstance(prompt, list) and return_text:
+
+        # Token-in-token-out: when prompt is List[int], build dummy text
+        # instead of decoding (decoded text has expanded pads which break
+        # the fast path and HF Processor).
+        original_input_ids = None
+        if isinstance(prompt, list):
             assert len(prompt) and isinstance(prompt[0], int)
-            prompt = self._processor.tokenizer.decode(prompt)
-        else:
-            prompt = prompt
+            original_input_ids = prompt
+            prompt = self.build_dummy_text(
+                mm_tokens=multimodal_tokens,
+                n_images=len(image_data) if image_data else 0,
+                n_videos=len(video_data) if video_data else 0,
+                n_audios=len(audio_data) if audio_data else 0,
+            )
 
         assert isinstance(prompt, str)
         # split text into list of normal text and special tokens
@@ -662,7 +671,7 @@ class BaseMultimodalProcessor(ABC):
             or cnt[Modality.AUDIO] != n_audio
             or getattr(self, "support_dynamic_frame_expansion", False)
         ):
-            return self.legacy_load_mm_data(
+            result = self.legacy_load_mm_data(
                 prompt=prompt,
                 multimodal_tokens=multimodal_tokens,
                 image_data=image_data,
@@ -672,18 +681,21 @@ class BaseMultimodalProcessor(ABC):
                 discard_alpha_channel=discard_alpha_channel,
                 audio_sample_rate=audio_sample_rate,
             )
-        # For models other than MiniCPMO and MiniCPMV,
-        # totally align multimodal_tokens, fast path
-        return self.fast_load_mm_data(
-            prompt=prompt,
-            multimodal_tokens=multimodal_tokens,
-            image_data=image_data,
-            video_data=video_data,
-            audio_data=audio_data,
-            return_text=return_text,
-            discard_alpha_channel=discard_alpha_channel,
-            audio_sample_rate=audio_sample_rate,
-        )
+        else:
+            # For models other than MiniCPMO and MiniCPMV,
+            # totally align multimodal_tokens, fast path
+            result = self.fast_load_mm_data(
+                prompt=prompt,
+                multimodal_tokens=multimodal_tokens,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                return_text=return_text,
+                discard_alpha_channel=discard_alpha_channel,
+                audio_sample_rate=audio_sample_rate,
+            )
+
+        return result
 
     def fast_load_mm_data(
         self,
@@ -912,6 +924,53 @@ class BaseMultimodalProcessor(ABC):
         indices_end = (input_ids == mm_end_id).nonzero(as_tuple=True)[0] - 1
 
         return list(zip(indices_start.tolist(), indices_end.tolist()))
+
+    def build_dummy_text(
+        self,
+        mm_tokens: "MultimodalSpecialTokens",
+        n_images: int = 0,
+        n_videos: int = 0,
+        n_audios: int = 0,
+    ) -> str:
+        """Build standard single-pad dummy text for token-in-token-out.
+
+        When the caller sends pre-tokenized input_ids, the processor still needs
+        a text prompt to drive the HF Processor. This method constructs a minimal
+        prompt with one placeholder token per multimodal item.
+
+        Subclasses may override this if their token format differs from the
+        default (e.g. Qwen wraps video_pad with vision_start/end).
+        """
+        parts: List[str] = []
+        if mm_tokens.image_token and n_images:
+            parts.extend([mm_tokens.image_token] * n_images)
+        if mm_tokens.video_token and n_videos:
+            parts.extend([mm_tokens.video_token] * n_videos)
+        if mm_tokens.audio_token and n_audios:
+            parts.extend([mm_tokens.audio_token] * n_audios)
+        return "".join(parts)
+
+    def finalize_token_in_token_out(
+        self,
+        mm_items: List[MultimodalDataItem],
+        mm_tokens: "MultimodalSpecialTokens",
+        original_input_ids: List[int],
+    ) -> None:
+        """Recompute mm_item offsets based on the caller's original input_ids.
+
+        When token-in-token-out is used, ``process_and_combine_mm_data`` computes
+        offsets on the dummy-text input_ids. This method fixes them to match the
+        caller's real input_ids so that ``pad_input_tokens`` replaces the correct
+        positions downstream.
+        """
+        orig_ids_tensor = torch.tensor(original_input_ids, dtype=torch.long)
+        for mm_item in mm_items:
+            mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
+            if mm_token_id is not None:
+                mm_item.offsets = self.get_mm_items_offset(
+                    input_ids=orig_ids_tensor,
+                    mm_token_id=mm_token_id,
+                )
 
     def collect_mm_items_from_processor_output(
         self, data_dict: dict, modality: Modality = None
